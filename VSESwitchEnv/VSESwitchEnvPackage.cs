@@ -31,17 +31,24 @@ namespace VSESwitchEnv
             var commandService = await GetServiceAsync(typeof(IMenuCommandService)) as OleMenuCommandService;
             Assumes.Present(commandService);
 
-            EnvSwitcher envSwitcher = new EnvSwitcher(dte, commandService);
+            EnvSwitcher envSwitcher = new(dte, commandService);
 
             var solutionService = await GetServiceAsync(typeof(SVsSolution)) as IVsSolution;
             Assumes.Present(solutionService);
             ErrorHandler.ThrowOnFailure(solutionService.GetProperty((int)__VSPROPID.VSPROPID_IsSolutionOpen, out object isSolutionOpen));
 
             if ((bool)isSolutionOpen)
-                envSwitcher.OnOpen();
+                envSwitcher.OnSolutionOpen();
 
-            SolutionEvents.OnAfterOpenSolution += envSwitcher.OnOpen;
-            SolutionEvents.OnAfterCloseSolution += envSwitcher.OnClose;
+            SolutionEvents.OnAfterOpenSolution += envSwitcher.OnSolutionOpen;
+            SolutionEvents.OnAfterCloseSolution += envSwitcher.OnSolutionClose;
+            SolutionEvents.OnBeforeOpenProject += envSwitcher.OnBeforeOpenProject;
+            dte.Events.BuildEvents.OnBuildBegin += envSwitcher.OnBuildBegin;
+            dte.Events.BuildEvents.OnBuildDone += envSwitcher.OnBuildDone;
+            dte.Events.DebuggerEvents.OnEnterRunMode += envSwitcher.OnEnterRunMode;
+            dte.Events.DebuggerEvents.OnEnterDesignMode += envSwitcher.OnEnterDesignMode;
+            dte.Events.WindowEvents.WindowCreated += envSwitcher.OnWindowCreated;
+            dte.Events.WindowEvents.WindowActivated += envSwitcher.OnWindowActivated;
         }
     }
 }
