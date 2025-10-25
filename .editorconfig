@@ -1,0 +1,4 @@
+root = true
+
+[*.cs]
+vs_command_before = Edit.FormatDocument
