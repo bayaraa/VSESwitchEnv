@@ -47,7 +47,7 @@
     <WarningLevel>4</WarningLevel>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="src\Config.cs" />
+    <Compile Include="src\EnvConfig.cs" />
     <Compile Include="src\EnvProject.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="src\EnvSolution.cs" />

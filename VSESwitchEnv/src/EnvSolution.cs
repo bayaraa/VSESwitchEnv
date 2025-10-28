@@ -1,12 +1,14 @@
 ﻿using EnvDTE;
-using EnvDTE80;
+using Microsoft.VisualStudio;
 using Microsoft.VisualStudio.Shell;
+using Microsoft.VisualStudio.Shell.Interop;
 using Microsoft.VisualStudio.VCProjectEngine;
 using System;
 using System.Collections.Generic;
 using System.ComponentModel.Design;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Xml.Linq;
 using Events = Microsoft.VisualStudio.Shell.Events;
 
 namespace VSESwitchEnv
@@ -15,41 +17,43 @@ namespace VSESwitchEnv
     {
         public static string SolDir { get; private set; } = null;
         public static string ExtDir { get; private set; } = null;
+
+        public static readonly EnvData SharedData = new();
         public static readonly Dictionary<string, EnvProject> Projects = new(StringComparer.OrdinalIgnoreCase);
 
-        private static DTE2 _dte = null;
         private static string _curProject = null;
-        private static bool _isEnabled = false;
-        private static bool _wasEnabled = false;
+        private static bool _disabled = false;
 
         private static WindowEvents _windowEvents;
         private static BuildEvents _buildEvents;
         private static DebuggerEvents _debuggerEvents;
 
-        public static void Initialize(DTE2 dte, OleMenuCommandService command)
+        public static void Initialize()
         {
             ThreadHelper.ThrowIfNotOnUIThread();
-            _dte = dte;
-
             Events.SolutionEvents.OnBeforeOpenSolution += OnBeforeOpenSolution;
+            Events.SolutionEvents.OnBeforeOpenProject += OnBeforeOpenProject;
+            Events.SolutionEvents.OnAfterOpenProject += OnAfterOpenProject;
             Events.SolutionEvents.OnAfterOpenSolution += OnAfterOpenSolution;
             Events.SolutionEvents.OnBeforeCloseSolution += OnBeforeCloseSolution;
-            _windowEvents = _dte.Events.WindowEvents;
-            _windowEvents.WindowCreated += OnWindowCreated;
-            _windowEvents.WindowActivated += OnWindowActivated;
+            Events.SolutionEvents.OnBeforeCloseProject += OnBeforeCloseProject;
+
+            _windowEvents = Services.DTE.Events.WindowEvents;
+            _windowEvents.WindowCreated += (window) => SetProject(window);
+            _windowEvents.WindowActivated += (window, _) => SetProject(window);
 
             var guid = new Guid("39032d76-f68d-41eb-9051-60cb49430b48");
-            command.AddCommand(new OleMenuCommand(new EventHandler(OnMenuGetList), new CommandID(guid, 0x101)));
+            Services.Cmd.AddCommand(new OleMenuCommand(new EventHandler(OnMenuGetList), new CommandID(guid, 0x101)));
             var cmd = new OleMenuCommand(new EventHandler(OnMenuSelect), new CommandID(guid, 0x102));
-            command.AddCommand(cmd);
-            cmd.BeforeQueryStatus += OnBeforeQueryStatus;
+            cmd.BeforeQueryStatus += (s, _) => ((OleMenuCommand)s).Enabled = (_curProject != null || !SharedData.IsEmpty()) && !_disabled;
+            Services.Cmd.AddCommand(cmd);
 
-            _buildEvents = _dte.Events.BuildEvents;
-            _buildEvents.OnBuildBegin += OnBuildBegin;
-            _buildEvents.OnBuildDone += OnBuildDone;
-            _debuggerEvents = _dte.Events.DebuggerEvents;
-            _debuggerEvents.OnEnterRunMode += OnEnterRunMode;
-            _debuggerEvents.OnEnterDesignMode += OnEnterDesignMode;
+            _buildEvents = Services.DTE.Events.BuildEvents;
+            _buildEvents.OnBuildBegin += (_, _) => _disabled = true;
+            _buildEvents.OnBuildDone += (_, _) => _disabled = false;
+            _debuggerEvents = Services.DTE.Events.DebuggerEvents;
+            _debuggerEvents.OnEnterRunMode += (_) => _disabled = true;
+            _debuggerEvents.OnEnterDesignMode += (_) => _disabled = false;
         }
 
         private static void OnBeforeOpenSolution(object sender, Events.BeforeOpenSolutionEventArgs e)
@@ -58,54 +62,69 @@ namespace VSESwitchEnv
             SolDir = Path.GetDirectoryName(e.SolutionFilename);
             ExtDir = Path.Combine(SolDir, Consts.ExtRelPath);
             Directory.CreateDirectory(ExtDir);
+            EnvConfig.Load();
+        }
 
-            if (Config.Load())
-                EnvProject.FixProjects(e.SolutionFilename);
+        private static void OnBeforeOpenProject(object sender, Events.BeforeOpenProjectEventArgs e)
+        {
+            if (e.Filename == null || !e.Filename.EndsWith(".vcxproj", StringComparison.OrdinalIgnoreCase))
+                return;
+
+            var name = Path.GetFileNameWithoutExtension(e.Filename);
+            if (!Projects.ContainsKey(name) && !SharedData.IsEmpty())
+                Projects.Add(name, new(name));
+            if (Projects.TryGetValue(name, out var project))
+            {
+                project.FixPropsImport(e.Filename);
+                project.CreateMainProps();
+            }
+        }
+
+        private static void OnAfterOpenProject(object sender, Events.OpenProjectEventArgs e)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (GetHierarchyProject(e.Hierarchy, out var proj) && proj.Object is VCProject vcProj)
+            {
+                var name = Path.GetFileNameWithoutExtension(proj.FileName);
+                if (Projects.TryGetValue(name, out var project))
+                {
+                    project.SetProject(vcProj);
+                    project.UpdateProps();
+                }
+            }
         }
 
         private static void OnAfterOpenSolution(object sender, Events.OpenSolutionEventArgs e)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
-            if (!_dte.Solution.IsOpen)
-                return;
-
-            foreach (Project proj in EnumerateProjects())
-            {
-                if (!string.IsNullOrEmpty(proj.FileName) && proj.Object is VCProject vcProj)
-                {
-                    var name = Path.GetFileNameWithoutExtension(proj.FileName);
-                    if (Projects.TryGetValue(name, out var project))
-                        project.Project = vcProj;
-                    else
-                        Projects.Add(name, new(name, vcProj));
-                    _curProject ??= name;
-                }
-            }
-            if (_curProject == null)
-                return;
-
-            Config.LoadStates();
-            if (GetProject(out var p, true) || GetProject(out p))
-                _isEnabled = true;
+            foreach (var p in Projects)
+                p.Value.UpdateProps();
         }
 
         private static void OnBeforeCloseSolution(object sender, EventArgs e)
         {
+            foreach (var p in Projects)
+                p.Value.DeleteMainProps();
             Projects.Clear();
+
+            SharedData.Clear();
             _curProject = null;
-            _isEnabled = false;
         }
 
-        private static void OnWindowCreated(Window window)
+        private static void OnBeforeCloseProject(object sender, Events.CloseProjectEventArgs e)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
-            SetProject(window);
-        }
-
-        private static void OnWindowActivated(Window gotFocus, Window lostFocus)
-        {
-            ThreadHelper.ThrowIfNotOnUIThread();
-            SetProject(gotFocus);
+            if (GetHierarchyProject(e.Hierarchy, out var proj))
+            {
+                var name = Path.GetFileNameWithoutExtension(proj.FileName);
+                if (Projects.TryGetValue(name, out var project))
+                {
+                    project.SetProject(null);
+                    project.DeleteMainProps();
+                    if (_curProject == name)
+                        _curProject = null;
+                }
+            }
         }
 
         private static void OnMenuGetList(object sender, EventArgs e)
@@ -116,17 +135,14 @@ namespace VSESwitchEnv
             if (eventArgs.InValue == null && eventArgs.OutValue != IntPtr.Zero)
             {
                 var options = new List<string>();
-                if (GetProject(out var shared, true))
-                {
-                    foreach (var env in shared.Data)
-                        options.Add($"{(shared.Selected == env.Key ? "⏵" : "　")}{env.Key} ");
-                }
+                foreach (var env in SharedData.List())
+                    options.Add($"{(SharedData.Selected() == env.Key ? "⏵" : "　")}{env.Key} ");
                 if (GetProject(out var project))
                 {
                     if (options.Count > 0)
                         options.Add("⋯⋯⋯⋯⋯⋯");
-                    foreach (var env in project.Data)
-                        options.Add($"{(project.Selected == env.Key ? "⏵" : "　")}{env.Key}");
+                    foreach (var env in project.List())
+                        options.Add($"{(project.Selected() == env.Key ? "⏵" : "　")}{env.Key}");
                 }
                 Marshal.GetNativeVariantForObject(options.ToArray(), eventArgs.OutValue);
             }
@@ -141,13 +157,13 @@ namespace VSESwitchEnv
             if (eventArgs.OutValue != IntPtr.Zero)
             {
                 string text = string.Empty;
-                if (GetProject(out var shared, true))
-                    text += shared.Selected;
+                if (!SharedData.IsEmpty())
+                    text += SharedData.Selected();
                 if (GetProject(out var project))
                 {
-                    if (text != string.Empty)
+                    if (!string.IsNullOrEmpty(text))
                         text += " / ";
-                    text += project.Selected;
+                    text += project.Selected();
                 }
                 text += text == string.Empty ? " ---" : "  ";
                 Marshal.GetNativeVariantForObject(text, eventArgs.OutValue);
@@ -157,55 +173,49 @@ namespace VSESwitchEnv
             string selected = eventArgs.InValue as string;
             if (selected != null && !selected.StartsWith("⋯"))
             {
-                if (GetProject(out var project, selected.EndsWith(" ")))
+                selected = selected.Remove(0, 1);
+                if (selected.EndsWith(" "))
                 {
-                    selected = selected.Remove(0, 1).Trim();
-                    if (selected != project.Selected)
+                    if (SharedData.Selected(selected.Trim()))
                     {
-                        UpdateProps(project, selected);
-                        OutputPane.Write($"[{project.Name}] environment updated: {project.Selected}.");
-                        Config.SaveStates();
+                        foreach (var p in Projects)
+                            p.Value.UpdateProps();
+                        OutputPane.Write($"[{Consts.SharedName}] environment updated: {SharedData.Selected()}.");
+                    }
+
+                }
+                else if (GetProject(out var project))
+                {
+                    if (project.Selected(selected))
+                    {
+                        project.UpdateProps();
+                        OutputPane.Write($"[{project.Name}] environment updated: {project.Selected()}.");
                     }
                 }
+                EnvConfig.Save();
             }
         }
 
-        private static void OnBeforeQueryStatus(object sender, EventArgs e)
+        private static bool GetHierarchyProject(IVsHierarchy hierarchy, out Project project)
         {
-            OleMenuCommand cmd = sender as OleMenuCommand;
-            if (cmd != null)
-                cmd.Enabled = _isEnabled;
-        }
-
-        private static void OnBuildBegin(vsBuildScope Scope, vsBuildAction Action)
-        {
-            _wasEnabled = _isEnabled;
-            _isEnabled = false;
-        }
-        private static void OnEnterRunMode(dbgEventReason reason)
-        {
-            _wasEnabled = _isEnabled;
-            _isEnabled = false;
-        }
-
-        private static void OnBuildDone(vsBuildScope Scope, vsBuildAction Action) => _isEnabled = _wasEnabled;
-        private static void OnEnterDesignMode(dbgEventReason reason) => _isEnabled = _wasEnabled;
-
-        public static void UpdateProps(EnvProject project, string selected)
-        {
-            var props = project.UpdateProps(selected);
-            if (project.Project == null && props != null)
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (hierarchy != null)
             {
-                foreach (var p in Projects)
-                    p.Value.ApplyProps(props);
+                var res = hierarchy.GetProperty(VSConstants.VSITEMID_ROOT, (int)__VSHPROPID.VSHPROPID_ExtObject, out object extObj);
+                if (ErrorHandler.Succeeded(res) && extObj is Project proj && !string.IsNullOrEmpty(proj.FileName) && proj.Object is VCProject)
+                {
+                    project = proj;
+                    return true;
+                }
             }
+            project = null;
+            return false;
         }
 
-        public static bool GetProject(out EnvProject project, bool shared = false)
+        private static bool GetProject(out EnvProject project)
         {
-            var name = shared ? Consts.SharedName : _curProject;
-            if (name != null && Projects.TryGetValue(name, out project))
-                return project;
+            if (_curProject != null && Projects.TryGetValue(_curProject, out project) && project.IsReady())
+                return true;
             project = null;
             return false;
         }
@@ -213,7 +223,7 @@ namespace VSESwitchEnv
         private static void SetProject(Window window)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
-            Project project = window?.Project ?? _dte.ActiveDocument?.ProjectItem?.ContainingProject;
+            Project project = window?.Project ?? Services.DTE.ActiveDocument?.ProjectItem?.ContainingProject;
             if (string.IsNullOrEmpty(project?.FileName))
                 return;
 
@@ -222,49 +232,8 @@ namespace VSESwitchEnv
                 return;
 
             _curProject = null;
-            _isEnabled = false;
-            if (Projects.TryGetValue(name, out var p) && p)
-            {
+            if (Projects.TryGetValue(name, out var p) && p.IsReady())
                 _curProject = name;
-                _isEnabled = true;
-            }
-            else if (GetProject(out p, true) && p)
-                _isEnabled = true;
-        }
-
-        private static IEnumerable<Project> EnumerateProjects()
-        {
-            ThreadHelper.ThrowIfNotOnUIThread();
-            foreach (Project p in _dte.Solution.Projects)
-            {
-                foreach (var sub in EnumerateProjectsRecursive(p))
-                    yield return sub;
-            }
-        }
-
-        private static IEnumerable<Project> EnumerateProjectsRecursive(Project parent)
-        {
-            ThreadHelper.ThrowIfNotOnUIThread();
-            if (parent == null)
-                yield break;
-
-            if (parent.Kind == Constants.vsProjectKindSolutionItems || parent.Kind == ProjectKinds.vsProjectKindSolutionFolder)
-            {
-                if (parent.ProjectItems != null)
-                {
-                    foreach (ProjectItem item in parent.ProjectItems)
-                    {
-                        var sub = item.SubProject;
-                        if (sub != null)
-                        {
-                            foreach (var p in EnumerateProjectsRecursive(sub))
-                                yield return p;
-                        }
-                    }
-                }
-                yield break;
-            }
-            yield return parent;
         }
     }
 }

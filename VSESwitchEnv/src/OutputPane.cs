@@ -1,5 +1,4 @@
 ﻿using EnvDTE;
-using EnvDTE80;
 using Microsoft.VisualStudio.Shell;
 using System;
 
@@ -7,14 +6,12 @@ namespace VSESwitchEnv
 {
     internal static class OutputPane
     {
-        private static DTE2 _dte = null;
         private static OutputWindowPane _pane = null;
         private static string _name = null;
         private static bool _isActive = false;
 
-        public static void Initialize(DTE2 dte, string name)
+        public static void Initialize(string name)
         {
-            _dte = dte;
             _name = name;
         }
 
@@ -44,16 +41,16 @@ namespace VSESwitchEnv
             if (_pane != null)
                 return;
 
-            if (_dte?.ToolWindows?.OutputWindow == null)
+            if (Services.DTE?.ToolWindows?.OutputWindow == null)
                 return;
 
             try
             {
-                _pane = _dte.ToolWindows.OutputWindow.OutputWindowPanes.Item(_name);
+                _pane = Services.DTE.ToolWindows.OutputWindow.OutputWindowPanes.Item(_name);
             }
             catch
             {
-                _pane = _dte.ToolWindows.OutputWindow.OutputWindowPanes.Add(_name);
+                _pane = Services.DTE.ToolWindows.OutputWindow.OutputWindowPanes.Add(_name);
             }
         }
     }

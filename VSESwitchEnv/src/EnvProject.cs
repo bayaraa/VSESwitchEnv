@@ -1,56 +1,30 @@
-﻿using System;
-using System.Collections.Generic;
+﻿using Microsoft.VisualStudio.Shell;
+using Microsoft.VisualStudio.VCProjectEngine;
+using System;
 using System.IO;
 using System.Linq;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
-using Microsoft.VisualStudio.VCProjectEngine;
 
 namespace VSESwitchEnv
 {
-    public class EnvVar(string name, string value)
-    {
-        public string Name { get; set; } = name.Split(':')[0].Trim();
-        public string Value { get; set; } = value.Trim();
-        public bool Define { get; set; } = name.Contains(":");
-
-        public static implicit operator bool(EnvVar i) => !string.IsNullOrEmpty(i.Name);
-    }
-
-    internal class EnvProject(string name, VCProject project = null)
+    internal class EnvProject(string name) : EnvData
     {
         public readonly string Name = name;
-        public readonly Dictionary<string, List<EnvVar>> Data = [];
-        public string Selected { get; private set; } = null;
-        public VCProject Project { get; set; } = project;
+        private VCProject _project = null;
 
-        public static implicit operator bool(EnvProject i) => i.Data.Count > 0;
+        public bool IsReady() => _project != null && !IsEmpty();
+        public void SetProject(VCProject project) => _project = project;
 
-        public string UpdateProps(string selected)
+        public void UpdateProps()
         {
-            if (selected == null || !Data.ContainsKey(selected))
-                return null;
-
-            Selected = selected;
-            var subProps = CreatePropsFile();
-            if (Project == null)
-                return subProps;
-
-            ApplyProps(subProps);
-            return null;
-        }
-
-        public void ApplyProps(string subProps)
-        {
-            if (Project == null)
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (!Services.DTE.Solution.IsOpen || _project == null)
                 return;
 
-            var ext = subProps.Substring(subProps.Length - 8);
-            var isShared = ext[1] == 's';
+            bool isDirty = false;
             var mainProps = Path.Combine(EnvSolution.ExtDir, $"{Name}.props");
-
-            bool modified = false;
-            foreach (VCConfiguration vcConf in Project.Configurations as IVCCollection)
+            foreach (VCConfiguration vcConf in _project.Configurations as IVCCollection)
             {
                 VCPropertySheet mainSheet = null;
                 foreach (VCPropertySheet sheet in vcConf.PropertySheets as IVCCollection)
@@ -63,60 +37,45 @@ namespace VSESwitchEnv
                 }
                 if (mainSheet != null)
                 {
-                    if (!modified)
+                    if (!isDirty)
                     {
                         foreach (VCPropertySheet sheet in mainSheet.PropertySheets as IVCCollection)
-                        {
-                            if (sheet.PropertySheetFile.EndsWith(ext))
-                                mainSheet.RemovePropertySheet(sheet);
-                        }
-                        var added = mainSheet.AddPropertySheet(subProps);
-                        if (isShared)
-                            try { mainSheet.MovePropertySheet(added, false); } catch { }
+                            mainSheet.RemovePropertySheet(sheet);
+                        mainSheet.AddPropertySheet(CreateProps());
                         mainSheet.Save();
-                        modified = true;
+                        isDirty = true;
                     }
                     vcConf.AddPropertySheet(mainProps);
                 }
             }
-            Project.Save();
+            if (isDirty)
+                _project.Save();
         }
 
-        public void PushData(string key, EnvVar var)
-        {
-            if (!Data.TryGetValue(key, out var data))
-                Data[key] = data = [];
-
-            data.Add(var);
-        }
-
-        private string CreatePropsFile()
+        private string CreateProps()
         {
             XNamespace ns = Consts.PropXmlNs;
             var userMacros = new XElement(ns + "PropertyGroup", new XAttribute("Label", "UserMacros"));
             var buildMacros = new XElement(ns + "ItemGroup");
             string prepDefs = string.Empty;
 
-            if (Data.TryGetValue(Selected, out var data))
+            foreach (var v in EnvSolution.SharedData.Current().Concat(Current()))
             {
-                foreach (var v in data)
+                var value = v.Value;
+                if (value.StartsWith("\"") && value.EndsWith("\""))
+                    value = value.Trim('"');
+                else if (value.StartsWith("R\"(") && value.EndsWith(")\""))
+                    value = value.Substring(3, value.Length - 5);
+                userMacros.Add(new XElement(ns + v.Name, value));
+                buildMacros.Add(new XElement(ns + "BuildMacro", new XAttribute("Include", v.Name),
+                    new XElement(ns + "Value", $"$({v.Name})"),
+                    new XElement(ns + "EnvironmentVariable", "true")
+                ));
+                if (v.Define)
                 {
-                    var value = v.Value;
-                    if (value.StartsWith("\"") && value.EndsWith("\""))
-                        value = value.Trim('"');
-                    else if (value.StartsWith("R\"(") && value.EndsWith(")\""))
-                        value = value.Substring(3, value.Length - 5);
-                    userMacros.Add(new XElement(ns + v.Name, value));
-                    buildMacros.Add(new XElement(ns + "BuildMacro", new XAttribute("Include", v.Name),
-                        new XElement(ns + "Value", $"$({v.Name})"),
-                        new XElement(ns + "EnvironmentVariable", "true")
-                    ));
-                    if (v.Define)
-                    {
-                        string defName = Regex.Replace(v.Name, "(?<=[a-z0-9])([A-Z])", "_$1");
-                        defName = Regex.Replace(defName, "([A-Z])([A-Z][a-z])", "$1_$2").ToUpperInvariant();
-                        prepDefs += defName + $"={v.Value};";
-                    }
+                    string defName = Regex.Replace(v.Name, "(?<=[a-z0-9])([A-Z])", "_$1");
+                    defName = Regex.Replace(defName, "([A-Z])([A-Z][a-z])", "$1_$2").ToUpperInvariant();
+                    prepDefs += defName + $"={v.Value};";
                 }
             }
 
@@ -128,47 +87,28 @@ namespace VSESwitchEnv
             }
             XDocument doc = new(root);
 
-            var ext = $"{(Project != null ? "x" : "s")}.props";
-            foreach (var f in Directory.GetFiles(EnvSolution.ExtDir, $"{Name}.*.{ext}"))
-                try { File.Delete(f); } catch { }
-
-            var props = Path.Combine(EnvSolution.ExtDir, $"{Name}.{DateTime.Now:HHmmss}.{ext}");
+            DeleteProps();
+            var props = Path.Combine(EnvSolution.ExtDir, $"{Name}.{DateTime.Now:HHmmss}.props");
             doc.Save(props);
             return props;
         }
 
-        public static void FixProjects(string solFile)
+        private void DeleteProps()
         {
-            foreach (var line in File.ReadAllLines(solFile))
-            {
-                if (line.Trim().StartsWith("Project("))
-                {
-                    var parts = line.Split(',');
-                    if (parts.Length >= 2)
-                    {
-                        var relPath = parts[1].Trim().Trim('"');
-                        if (relPath.EndsWith(".vcxproj", StringComparison.OrdinalIgnoreCase))
-                        {
-                            if (EnvSolution.Projects.ContainsKey(Consts.SharedName) || EnvSolution.Projects.ContainsKey(Path.GetFileNameWithoutExtension(relPath)))
-                                FixPropsImport(Path.Combine(EnvSolution.SolDir, relPath));
-                        }
-                    }
-                }
-            }
+            foreach (var f in Directory.GetFiles(EnvSolution.ExtDir, $"{Name}.*.props"))
+                try { File.Delete(f); } catch { }
         }
 
-        private static void FixPropsImport(string projFile)
+        public void FixPropsImport(string projFile)
         {
             bool isDirty = false;
             var doc = XDocument.Load(projFile);
             var ns = doc.Root.GetDefaultNamespace();
-
-            var props = $"{Path.GetFileNameWithoutExtension(projFile)}.props";
-            var propRelPath = $"{Consts.ExtRelPath}\\{props}";
+            var propRelPath = $"{Consts.ExtRelPath}\\{Name}.props";
             var propAttr = new XAttribute("Project", $"$(SolutionDir)\\{propRelPath}");
             var propImport = new XElement(ns + "Import", propAttr, new XAttribute("Condition", $"exists('{propAttr.Value}')"));
 
-            var sheetNodes = doc.Descendants(ns + "ImportGroup").Where(item => (string)item.Attribute("Label") == "PropertySheets");
+            var sheetNodes = doc.Descendants(ns + "ImportGroup").Where(item => (string?)item.Attribute("Label") == "PropertySheets");
             foreach (var sheetNode in sheetNodes)
             {
                 var propNode = sheetNode.Descendants(ns + "Import").Where(item => item.Attribute("Project").Value.EndsWith(propRelPath)).FirstOrDefault();
@@ -180,10 +120,20 @@ namespace VSESwitchEnv
             }
             if (isDirty)
                 doc.Save(projFile);
+        }
 
-            ns = Consts.PropXmlNs;
-            doc = new XDocument(new XElement(ns + "Project", new XAttribute("ToolsVersion", "Current"), new XElement(ns + "ImportGroup", new XAttribute("Label", "PropertySheets"))));
-            doc.Save(Path.Combine(EnvSolution.ExtDir, props));
+        public void CreateMainProps()
+        {
+            XNamespace ns = Consts.PropXmlNs;
+            var doc = new XDocument(new XElement(ns + "Project", new XAttribute("ToolsVersion", "Current"),
+                new XElement(ns + "ImportGroup", new XAttribute("Label", "PropertySheets"))));
+            doc.Save(Path.Combine(EnvSolution.ExtDir, $"{Name}.props"));
+        }
+
+        public void DeleteMainProps()
+        {
+            DeleteProps();
+            try { File.Delete(Path.Combine(EnvSolution.ExtDir, $"{Name}.props")); } catch { }
         }
     }
 }

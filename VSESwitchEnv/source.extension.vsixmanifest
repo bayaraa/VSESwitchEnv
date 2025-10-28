@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011" xmlns:d="http://schemas.microsoft.com/developer/vsx-schema-design/2011">
     <Metadata>
-        <Identity Id="VSESwitchEnv.042b72d8-5c25-4057-802a-6dc34059f24b" Version="1.0.2" Language="en-US" Publisher="Bayaraa" />
+        <Identity Id="VSESwitchEnv.042b72d8-5c25-4057-802a-6dc34059f24b" Version="1.0.3" Language="en-US" Publisher="Bayaraa" />
         <DisplayName>VSESwitchEnv</DisplayName>
         <Description xml:space="preserve">Quickly switch between custom build environments and apply project-specific variables across multiple configurations.</Description>
         <MoreInfo>https://github.com/bayaraa/VSESwitchEnv</MoreInfo>

@@ -21,13 +21,18 @@ namespace VSESwitchEnv
         {
             await JoinableTaskFactory.SwitchToMainThreadAsync(cancellationToken);
 
-            var dte = await GetServiceAsync(typeof(DTE)) as DTE2;
-            var commandService = await GetServiceAsync(typeof(IMenuCommandService)) as OleMenuCommandService;
-
-            OutputPane.Initialize(dte, Consts.ExtName);
-            EnvSolution.Initialize(dte, commandService);
+            Services.DTE = await GetServiceAsync(typeof(DTE)) as DTE2;
+            Services.Cmd = await GetServiceAsync(typeof(IMenuCommandService)) as OleMenuCommandService;
+            OutputPane.Initialize(Consts.ExtName);
+            EnvSolution.Initialize();
         }
     }
+    internal static class Services
+    {
+        public static DTE2 DTE;
+        public static OleMenuCommandService Cmd;
+    }
+
     internal static class Consts
     {
         public const string ExtName = "VSESwitchEnv";
