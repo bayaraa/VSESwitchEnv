@@ -3,7 +3,7 @@
 **VSESwitchEnv** is a Visual Studio extension for **C++ projects** that lets you instantly switch between multiple build environments (e.g., *Local*, *Release*, *Testing*) directly from the toolbar.
 It’s designed for native developers who frequently need to toggle asset paths, SDK versions, or build-time macros without manually editing project settings.
 
-*(Requires Visual Studio 2022 and the VC++ project system.)*
+*(Requires Visual Studio 2022/2026 and the VC++ project system.)*
 
 ---
 
